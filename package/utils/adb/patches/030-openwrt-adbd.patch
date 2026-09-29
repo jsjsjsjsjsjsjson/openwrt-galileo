@@ -1,0 +1,242 @@
+diff --git a/adb/adb.c b/adb/adb.c
+index 1834472..2aac0ec 100644
+--- a/adb/adb.c
++++ b/adb/adb.c
+@@ -35,12 +35,14 @@
+ 
+ #if !ADB_HOST
+ #include <cutils/properties.h>
++#ifndef OPENWRT_ADBD
+ #include <private/android_filesystem_config.h>
+ #include <sys/capability.h>
++#include <selinux/selinux.h>
++#endif
+ #include <sys/mount.h>
+ #include <sys/prctl.h>
+ #include <getopt.h>
+-#include <selinux/selinux.h>
+ #endif
+ 
+ #if ADB_TRACE
+@@ -145,7 +147,7 @@ void  adb_trace_init(void)
+     }
+ }
+ 
+-#if !ADB_HOST
++#if !ADB_HOST && !defined(OPENWRT_ADBD)
+ /*
+  * Implements ADB tracing inside the emulator.
+  */
+@@ -1233,7 +1235,7 @@ void build_local_name(char* target_str, size_t target_size, int server_port)
+   snprintf(target_str, target_size, "tcp:%d", server_port);
+ }
+ 
+-#if !ADB_HOST
++#if !ADB_HOST && !defined(OPENWRT_ADBD)
+ 
+ static void drop_capabilities_bounding_set_if_needed() {
+ #ifdef ALLOW_ADBD_ROOT
+@@ -1299,7 +1301,7 @@ int adb_main(int is_daemon, int server_port)
+     int port;
+     char value[PROPERTY_VALUE_MAX];
+ 
+-    umask(000);
++    umask(022);
+ #endif
+ 
+     atexit(adb_cleanup);
+@@ -1343,6 +1345,7 @@ int adb_main(int is_daemon, int server_port)
+           " unchanged.\n");
+     }
+ 
++#ifndef OPENWRT_ADBD
+     /* add extra groups:
+     ** AID_ADB to access the USB driver
+     ** AID_LOG to read system logs (adb logcat)
+@@ -1388,6 +1391,7 @@ int adb_main(int is_daemon, int server_port)
+         }
+     }
+ 
++#endif
+     int usb = 0;
+     if (access(USB_ADB_PATH, F_OK) == 0 || access(USB_FFS_ADB_EP0, F_OK) == 0) {
+         // listen on USB
+@@ -1395,6 +1399,7 @@ int adb_main(int is_daemon, int server_port)
+         usb = 1;
+     }
+ 
++#ifndef OPENWRT_ADBD
+     // If one of these properties is set, also listen on that port
+     // If one of the properties isn't set and we couldn't listen on usb,
+     // listen on the default port.
+@@ -1411,6 +1416,10 @@ int adb_main(int is_daemon, int server_port)
+         local_init(DEFAULT_ADB_LOCAL_TRANSPORT_PORT);
+     }
+ 
++#else
++    if (!usb)
++        fatal("FunctionFS is not mounted");
++#endif
+     D("adb_main(): pre init_jdwp()\n");
+     init_jdwp();
+     D("adb_main(): post init_jdwp()\n");
+@@ -1692,7 +1701,11 @@ int main(int argc, char **argv)
+ #else
+     /* If adbd runs inside the emulator this will enable adb tracing via
+      * adb-debug qemud service in the emulator. */
++#ifndef OPENWRT_ADBD
+     adb_qemu_trace_init();
++#else
++    adb_trace_init();
++#endif
+     while(1) {
+         int c;
+         int option_index = 0;
+diff --git a/adb/adb_auth_client.c b/adb/adb_auth_client.c
+index 55e9dca..aedafba 100644
+--- a/adb/adb_auth_client.c
++++ b/adb/adb_auth_client.c
+@@ -17,6 +17,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <resolv.h>
++#ifdef OPENWRT_ADBD
++#include <mbedtls/base64.h>
++#endif
+ #include <cutils/list.h>
+ #include <cutils/sockets.h>
+ 
+@@ -36,8 +39,12 @@ struct adb_public_key {
+ };
+ 
+ static char *key_paths[] = {
++#ifdef OPENWRT_ADBD
++    "/etc/adbd/adb_keys",
++#else
+     "/adb_keys",
+     "/data/misc/adb/adb_keys",
++#endif
+     NULL
+ };
+ 
+@@ -75,7 +82,15 @@ static void read_keys(const char *file, struct listnode *list)
+         if (sep)
+             *sep = '\0';
+ 
++#ifdef OPENWRT_ADBD
++        size_t decoded_len;
++        ret = mbedtls_base64_decode((unsigned char *)&key->key,
++                                   sizeof(key->key) + 4, &decoded_len,
++                                   (const unsigned char *)buf, strlen(buf));
++        ret = ret == 0 ? (int)decoded_len : -1;
++#else
+         ret = __b64_pton(buf, (u_char *)&key->key, sizeof(key->key) + 4);
++#endif
+         if (ret != sizeof(key->key)) {
+             D("%s: Invalid base64 data ret=%d\n", file, ret);
+             free(key);
+diff --git a/adb/file_sync_service.c b/adb/file_sync_service.c
+index 7933858..c42d301 100644
+--- a/adb/file_sync_service.c
++++ b/adb/file_sync_service.c
+@@ -25,8 +25,21 @@
+ #include <unistd.h>
+ 
+ #include <errno.h>
++#ifndef OPENWRT_ADBD
+ #include <private/android_filesystem_config.h>
+ #include <selinux/android.h>
++#else
++#include <stdint.h>
++static inline void fs_config(const char *path, int dir, unsigned *uid,
++                             unsigned *gid, unsigned *mode, uint64_t *cap)
++{
++    /* OpenWrt has no Android-specific ownership or capability mappings. */
++}
++static inline int selinux_android_restorecon(const char *path, unsigned flags)
++{
++    return 0;
++}
++#endif
+ #include "sysdeps.h"
+ 
+ #define TRACE_TAG  TRACE_SYNC
+diff --git a/adb/services.c b/adb/services.c
+index bcfc163..378bd40 100644
+--- a/adb/services.c
++++ b/adb/services.c
+@@ -84,6 +84,11 @@ void restart_root_service(int fd, void *cookie)
+ 
+ void restart_tcp_service(int fd, void *cookie)
+ {
++#ifdef OPENWRT_ADBD
++    const char *message = "TCP mode is disabled; this device uses USB only\n";
++    writex(fd, message, strlen(message));
++    adb_close(fd);
++#else
+     char buf[100];
+     char value[PROPERTY_VALUE_MAX];
+     int port = (int) (uintptr_t) cookie;
+@@ -100,6 +105,7 @@ void restart_tcp_service(int fd, void *cookie)
+     snprintf(buf, sizeof(buf), "restarting in TCP mode port: %d\n", port);
+     writex(fd, buf, strlen(buf));
+     adb_close(fd);
++#endif
+ }
+ 
+ void restart_usb_service(int fd, void *cookie)
+@@ -302,8 +308,12 @@ static int create_subproc_raw(const char *cmd, const char *arg0, const char *arg
+ #if ADB_HOST
+ #define SHELL_COMMAND "/bin/sh"
+ #else
++#ifdef OPENWRT_ADBD
++#define SHELL_COMMAND "/bin/sh"
++#else
+ #define SHELL_COMMAND "/system/bin/sh"
+ #endif
++#endif
+ 
+ #if !ADB_HOST
+ static void subproc_waiter_service(int fd, void *cookie)
+diff --git a/adb/transport_local.c b/adb/transport_local.c
+index 948cc15..418c265 100644
+--- a/adb/transport_local.c
++++ b/adb/transport_local.c
+@@ -189,7 +189,7 @@ static void *server_socket_thread(void * arg)
+ }
+ 
+ /* This is relevant only for ADB daemon running inside the emulator. */
+-#if !ADB_HOST
++#if !ADB_HOST && !defined(OPENWRT_ADBD)
+ /*
+  * Redefine open and write for qemu_pipe.h that contains inlined references
+  * to those routines. We will redifine them back after qemu_pipe.h inclusion.
+@@ -307,7 +307,7 @@ void local_init(int port)
+     if(HOST) {
+         func = client_socket_thread;
+     } else {
+-#if ADB_HOST
++#if ADB_HOST || defined(OPENWRT_ADBD)
+         func = server_socket_thread;
+ #else
+         /* For the adbd daemon in the system image we need to distinguish
+diff --git a/include/cutils/properties.h b/include/cutils/properties.h
+index 798db8b..95febef 100644
+--- a/include/cutils/properties.h
++++ b/include/cutils/properties.h
+@@ -17,9 +17,14 @@
+ #ifndef __CUTILS_PROPERTIES_H
+ #define __CUTILS_PROPERTIES_H
+ 
+-#include <sys/cdefs.h>
+ #include <stddef.h>
++#ifdef OPENWRT_ADBD
++#define PROP_NAME_MAX 32
++#define PROP_VALUE_MAX 92
++#else
++#include <sys/cdefs.h>
+ #include <sys/system_properties.h>
++#endif
+ #include <stdint.h>
+ 
+ #ifdef __cplusplus

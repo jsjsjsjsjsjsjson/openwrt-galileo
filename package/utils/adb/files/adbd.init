@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+
+START=13
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	local enabled auth
+	config_load adbd
+	config_get_bool enabled main enabled 1
+	config_get_bool auth main auth 0
+	[ "$enabled" = 1 ] || return 0
+	if [ "$auth" = 1 ] && [ ! -s /etc/adbd/adb_keys ]; then
+		logger -t adbd "Authentication enabled but /etc/adbd/adb_keys is empty"
+		return 1
+	fi
+
+	procd_open_instance
+	procd_set_param command /usr/libexec/adbd-gadget
+	procd_set_param env ADBD_AUTH="$auth"
+	procd_set_param respawn 3600 5 5
+	procd_set_param term_timeout 10
+	# procd's libsetlbf makes BusyBox printf split ConfigFS attribute writes.
+	procd_set_param stdout 0
+	procd_set_param stderr 1
+	procd_set_param file /etc/config/adbd /etc/adbd/adb_keys
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger adbd
+}

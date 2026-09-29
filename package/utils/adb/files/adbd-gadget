@@ -1,0 +1,80 @@
+#!/bin/sh
+
+set -e
+
+gadget=/sys/kernel/config/usb_gadget/galileo-adb
+ffs=/dev/usb-ffs/adb
+adbd_pid=
+owned=0
+
+cleanup() {
+	set +e
+	trap - EXIT INT TERM
+	if [ "$owned" = 1 ]; then
+		[ ! -f "$gadget/UDC" ] || printf '\n' > "$gadget/UDC"
+		if [ -n "$adbd_pid" ]; then
+			kill "$adbd_pid" 2>/dev/null || true
+			wait "$adbd_pid" 2>/dev/null || true
+		fi
+		umount "$ffs" 2>/dev/null || true
+		rm -f "$gadget/configs/c.1/ffs.adb"
+		rmdir "$gadget/functions/ffs.adb" "$gadget/configs/c.1/strings/0x409" \
+			"$gadget/configs/c.1" "$gadget/strings/0x409" "$gadget" 2>/dev/null || true
+	fi
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+udc=
+for device in /sys/class/udc/*; do
+	[ -e "$device" ] || continue
+	udc="${device##*/}"
+	break
+done
+if [ -z "$udc" ]; then
+	echo "adbd: no USB device controller found" >&2
+	exit 1
+fi
+
+mkdir -p /sys/kernel/config
+grep -qs ' /sys/kernel/config configfs ' /proc/mounts || \
+	mount -t configfs configfs /sys/kernel/config
+
+# Refuse to take over a gadget created by another process.
+mkdir "$gadget"
+owned=1
+printf '0x18d1\n' > "$gadget/idVendor"
+printf '0x4ee7\n' > "$gadget/idProduct"
+printf '0x0200\n' > "$gadget/bcdUSB"
+mkdir "$gadget/strings/0x409"
+serial="$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':')"
+[ -n "$serial" ] || serial=galileo
+printf '%s\n' "$serial" > "$gadget/strings/0x409/serialnumber"
+printf 'Intel\n' > "$gadget/strings/0x409/manufacturer"
+printf 'Galileo Gen 2 OpenWrt ADB\n' > "$gadget/strings/0x409/product"
+mkdir "$gadget/configs/c.1" "$gadget/configs/c.1/strings/0x409"
+printf 'ADB\n' > "$gadget/configs/c.1/strings/0x409/configuration"
+printf '0xc0\n' > "$gadget/configs/c.1/bmAttributes"
+printf '2\n' > "$gadget/configs/c.1/MaxPower"
+mkdir "$gadget/functions/ffs.adb"
+ln -s "$gadget/functions/ffs.adb" "$gadget/configs/c.1/ffs.adb"
+mkdir -p "$ffs"
+mount -t functionfs adb "$ffs"
+
+/usr/sbin/adbd &
+adbd_pid=$!
+
+# Endpoint files appear after adbd has supplied the FunctionFS descriptors.
+attempt=0
+while [ ! -e "$ffs/ep1" ] || [ ! -e "$ffs/ep2" ]; do
+	kill -0 "$adbd_pid" 2>/dev/null || exit 1
+	attempt=$((attempt + 1))
+	if [ "$attempt" -gt 5 ]; then
+		echo "adbd: timed out waiting for FunctionFS descriptors" >&2
+		exit 1
+	fi
+	sleep 1
+done
+printf '%s\n' "$udc" > "$gadget/UDC"
+wait "$adbd_pid"

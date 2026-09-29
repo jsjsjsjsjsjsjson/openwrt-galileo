@@ -8,6 +8,7 @@ GRUB_TERMINAL_CONFIG := terminal_input console; terminal_output console
 define Device/galileo
   DEVICE_VENDOR := Intel
   DEVICE_MODEL := Galileo Gen 2
+  DEVICE_PACKAGES := adbd
   GRUB2_VARIANT := legacy
 endef
 TARGET_DEVICES += galileo
