@@ -33,6 +33,12 @@ silicom-80500-0214-*)
         ucidef_set_led_netdev "lan" "LAN" "multicolor:fp_right" "br-lan"
         ;;
 esac
+
+case "$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null)" in
+GalileoGen2)
+	ucidef_set_led_default "user" "L (User)" "galileo:green:user" "1"
+	;;
+esac
 board_config_flush
 
 exit 0

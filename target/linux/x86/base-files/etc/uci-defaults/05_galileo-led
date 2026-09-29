@@ -1,0 +1,34 @@
+#!/bin/sh
+
+[ "$(cat /sys/devices/virtual/dmi/id/board_name 2>/dev/null)" = "GalileoGen2" ] || exit 0
+
+. /lib/functions.sh
+
+user_led_found=0
+
+migrate_led() {
+	local sysfs
+	config_get sysfs "$1" sysfs
+	case "$sysfs" in
+	mmc0|mmc0::)
+		uci -q delete "system.$1"
+		;;
+	galileo:green:user)
+		user_led_found=1
+		;;
+	esac
+}
+
+config_load system
+config_foreach migrate_led led
+
+if [ "$user_led_found" = 0 ]; then
+	uci set system.galileo_user=led
+	uci set system.galileo_user.name='L (User)'
+	uci set system.galileo_user.sysfs='galileo:green:user'
+	uci set system.galileo_user.trigger='none'
+	uci set system.galileo_user.default='1'
+fi
+
+uci commit system
+exit 0

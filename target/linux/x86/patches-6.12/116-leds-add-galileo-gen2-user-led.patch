@@ -1,0 +1,33 @@
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index c275963..27e7f08 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -26,6 +26,16 @@ config LEDS_CLASS
+ 	  This option enables the LED sysfs class in /sys/class/leds.  You'll
+ 	  need this to do anything useful with LEDs.  If unsure, say Y.
+ 
++config LEDS_GALILEO
++	tristate "Intel Galileo Gen 2 user LED"
++	depends on X86 && X86_INTEL_QUARK && DMI
++	depends on LEDS_CLASS && GPIO_SCH && GPIO_PCA953X
++	help
++	  Expose the D13 (L) LED on Intel Galileo Gen 2 boards, including
++	  the I2C GPIO expander controls for its mux and output buffer.
++	  This reserves Arduino D13; it cannot be used as SPI SCLK while
++	  the driver is active.
++
+ config LEDS_CLASS_FLASH
+ 	tristate "LED Flash Class Support"
+ 	depends on LEDS_CLASS
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index e8b39ef..6ef93d1 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -29,6 +29,7 @@ obj-$(CONFIG_LEDS_CPCAP)		+= leds-cpcap.o
+ obj-$(CONFIG_LEDS_CROS_EC)		+= leds-cros_ec.o
+ obj-$(CONFIG_LEDS_DA903X)		+= leds-da903x.o
+ obj-$(CONFIG_LEDS_DA9052)		+= leds-da9052.o
++obj-$(CONFIG_LEDS_GALILEO)		+= leds-galileo.o
+ obj-$(CONFIG_LEDS_GPIO)			+= leds-gpio.o
+ obj-$(CONFIG_LEDS_GPIO_REGISTER)	+= leds-gpio-register.o
+ obj-$(CONFIG_LEDS_HP6XX)		+= leds-hp6xx.o
