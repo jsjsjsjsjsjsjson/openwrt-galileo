@@ -235,6 +235,7 @@ menu "Target Images"
 		depends on TARGET_ROOTFS_EXT4FS || TARGET_ROOTFS_JFFS2 || TARGET_ROOTFS_SQUASHFS || TARGET_ROOTFS_EROFS
 		select PACKAGE_grub2
 		select PACKAGE_grub2-bios-setup
+		default n if TARGET_x86_galileo
 		default y
 
 	config GRUB_EFI_IMAGES
@@ -252,6 +253,7 @@ menu "Target Images"
 	config GRUB_CONSOLE
 		bool "Use Console Terminal (in addition to Serial)"
 		depends on GRUB_IMAGES || GRUB_EFI_IMAGES
+		default n if TARGET_x86_galileo
 		default y
 
 	config GRUB_BAUDRATE
@@ -268,6 +270,7 @@ menu "Target Images"
 	config GRUB_BOOTOPTS
 		string "Extra kernel boot options"
 		depends on GRUB_IMAGES || GRUB_EFI_IMAGES
+		default "reboot=efi,warm" if TARGET_x86_galileo
 		help
 		  If you don't know, just leave it blank.
 
@@ -312,6 +315,7 @@ menu "Target Images"
 	config TARGET_SERIAL
 		string "Serial port device"
 		depends on TARGET_x86 || TARGET_armsr || TARGET_loongarch64
+		default "ttyS1" if TARGET_x86_galileo
 		default "ttyS0"
 
 	config TARGET_IMAGES_GZIP
