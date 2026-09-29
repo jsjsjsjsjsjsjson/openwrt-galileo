@@ -1,0 +1,40 @@
+From f424f311edc81df8b168f17dddbc1be83fac6b9c Mon Sep 17 00:00:00 2001
+From: jsjsjsjsjsjsjson <chara8892@gmail.com>
+Date: Sun, 16 Aug 2026 21:17:58 +0800
+Subject: [PATCH 2/6] x86/mm: notify recoverable Quark LOCK page faults
+
+Quark X1000 may repeat the instruction preceding a LOCKed operation when
+that operation faults. Route only the characteristic ffff0006 and
+ffff0007 user faults through the die notifier so the optional QuarkCompat
+handler can repair state before normal fault handling uses the corrupted
+address.
+
+Signed-off-by: jsjsjsjsjsjsjson <chara8892@gmail.com>
+---
+ arch/x86/mm/fault.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index adef0e8dc..06ce1af0c 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1216,6 +1216,19 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	vm_fault_t fault;
+ 	unsigned int flags = FAULT_FLAG_DEFAULT;
+ 
++	/*
++	 * Quark X1000 corrupts the high half of the error code when a LOCKed
++	 * userspace operation faults.  Give the optional QuarkCompat handler a
++	 * chance to repair the architectural state before the bogus
++	 * address is interpreted as a normal page fault.
++	 */
++	if (IS_ENABLED(CONFIG_X86_QUARK_COMPAT) &&
++	    unlikely(error_code == 0xffff0006UL ||
++		     error_code == 0xffff0007UL) &&
++	    notify_die(DIE_PAGE_FAULT, "Quark LOCK page fault", regs,
++		       error_code, X86_TRAP_PF, SIGSEGV) == NOTIFY_STOP)
++		return;
++
+ 	tsk = current;
+ 	mm = tsk->mm;
+ 

@@ -1,0 +1,110 @@
+From 27c89a5573d92370bf49a3ef75c90bd193b11079 Mon Sep 17 00:00:00 2001
+From: jsjsjsjsjsjsjson <chara8892@gmail.com>
+Date: Mon, 17 Aug 2026 00:55:12 +0800
+Subject: [PATCH 6/6] x86/quark-compat: emulate ENDBR32 as a NOP
+
+CET-enabled Debian i386 binaries contain ENDBR32 function-entry markers.
+Intel Quark X1000 raises #UD for this encoding even though the processor
+has no CET state to update.
+
+Recognize F3 0F 1E FB in 32-bit userspace, advance EIP by four bytes, and
+expose a dedicated emulation counter.
+
+Signed-off-by: jsjsjsjsjsjsjson <chara8892@gmail.com>
+---
+ arch/x86/Kconfig               | 12 ++++++------
+ arch/x86/kernel/quark_compat.c | 21 ++++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index f6331f52b..f92e2a933 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -916,10 +916,10 @@ config X86_QUARK_COMPAT
+ 	depends on X86_32 && !X86_CMOV
+ 	help
+ 	  Emulate the i686 integer CMOVcc, x87 FCMOVcc and x87
+-	  FCOMI/FUCOMI/FCOMIP/FUCOMIP instruction families when a 32-bit user
+-	  process executes them on an i586-class processor which lacks CMOV.
+-	  This is useful for processors such as Intel Quark X1000 when running
+-	  an i686 userspace.
++	  FCOMI/FUCOMI/FCOMIP/FUCOMIP instruction families, plus the ENDBR32
++	  landing pad emitted by CET-enabled toolchains, when a 32-bit user
++	  process executes them on an i586-class processor.  This is useful for
++	  processors such as Intel Quark X1000 when running an i686 userspace.
+ 
+ 	  The integer emulator handles all condition codes, register and memory
+ 	  sources, 16-bit and 32-bit operands and addresses, SIB addressing,
+@@ -934,8 +934,8 @@ config X86_QUARK_COMPAT
+ 	  Select Y to make the emulator available before the first userspace
+ 	  process is started.
+ 
+-	  This option does not emulate other instructions introduced with
+-	  i686.  If unsure, say N.
++	  This option does not emulate other instructions introduced after
++	  i586.  If unsure, say N.
+ 
+ config HPET_TIMER
+ 	def_bool X86_64
+diff --git a/arch/x86/kernel/quark_compat.c b/arch/x86/kernel/quark_compat.c
+index a89c5bc18..7997cc4dc 100644
+--- a/arch/x86/kernel/quark_compat.c
++++ b/arch/x86/kernel/quark_compat.c
+@@ -35,6 +35,7 @@
+ #endif
+ 
+ #define CMOV_MAX_INSN_LEN 15
++#define ENDBR32_INSN_LEN  4
+ #define QUARK_LOCK_NOT_PRESENT_ERROR 0xffff0006UL
+ #define QUARK_LOCK_PROTECTION_ERROR  0xffff0007UL
+ 
+@@ -73,6 +74,7 @@ struct cmov_seg_desc {
+ static atomic64_t trap_count = ATOMIC64_INIT(0);
+ static atomic64_t emulated_count = ATOMIC64_INIT(0);
+ static atomic64_t x87_emulated_count = ATOMIC64_INIT(0);
++static atomic64_t endbr_emulated_count = ATOMIC64_INIT(0);
+ static atomic64_t fault_count = ATOMIC64_INIT(0);
+ static atomic64_t deferred_count = ATOMIC64_INIT(0);
+ static atomic64_t lock_fault_count = ATOMIC64_INIT(0);
+@@ -954,9 +956,10 @@ static ssize_t quark_compat_stats_read(struct file *file,
+ 	int length;
+ 
+ 	length = scnprintf(buffer, sizeof(buffer),
+-			   "emulated=%lld\nx87_emulated=%lld\ntraps=%lld\ndeferred_pageins=%lld\nsource_faults=%lld\nlock_faults=%lld\nlock_recovered=%lld\nlock_unrecoverable=%lld\n",
++			   "emulated=%lld\nx87_emulated=%lld\nendbr_emulated=%lld\ntraps=%lld\ndeferred_pageins=%lld\nsource_faults=%lld\nlock_faults=%lld\nlock_recovered=%lld\nlock_unrecoverable=%lld\n",
+ 			   (long long)atomic64_read(&emulated_count),
+ 			   (long long)atomic64_read(&x87_emulated_count),
++			   (long long)atomic64_read(&endbr_emulated_count),
+ 			   (long long)atomic64_read(&trap_count),
+ 			   (long long)atomic64_read(&deferred_count),
+ 			   (long long)atomic64_read(&fault_count),
+@@ -1018,6 +1021,7 @@ static int quark_compat_die_notify(struct notifier_block *nb,
+ 	struct die_args *args = data;
+ 	struct cmov_decoded insn;
+ 	struct pt_regs *regs;
++	u8 endbr_opcode[ENDBR32_INSN_LEN];
+ 	u8 x87_opcode[2];
+ 	u32 source;
+ 	int ret;
+@@ -1029,6 +1033,21 @@ static int quark_compat_die_notify(struct notifier_block *nb,
+ 	regs = args->regs;
+ 	if (!user_mode(regs) || v8086_mode(regs))
+ 		return NOTIFY_DONE;
++	if (!copy_from_user_nofault(endbr_opcode,
++				    (const void __user *)regs->ip,
++				    sizeof(endbr_opcode)) &&
++	    endbr_opcode[0] == 0xf3 && endbr_opcode[1] == 0x0f &&
++	    endbr_opcode[2] == 0x1e && endbr_opcode[3] == 0xfb) {
++		regs->ip += ENDBR32_INSN_LEN;
++		atomic64_inc(&trap_count);
++		atomic64_inc(&emulated_count);
++		atomic64_inc(&endbr_emulated_count);
++		if (verbose)
++			pr_info_ratelimited("pid %d: emulated ENDBR32 at %#lx\n",
++					    task_pid_nr(current),
++					    regs->ip - ENDBR32_INSN_LEN);
++		return NOTIFY_STOP;
++	}
+ 	if (!copy_from_user_nofault(x87_opcode, (const void __user *)regs->ip,
+ 				    sizeof(x87_opcode)) &&
+ 	    quark_compat_emulate_x87(regs, x87_opcode[0], x87_opcode[1]))

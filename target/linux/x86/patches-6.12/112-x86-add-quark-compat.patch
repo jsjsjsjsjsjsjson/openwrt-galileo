@@ -1,0 +1,1100 @@
+From 82fc7b0f7bd0e9398624cc6fcb0de36d72a4ec8a Mon Sep 17 00:00:00 2001
+From: jsjsjsjsjsjsjson <chara8892@gmail.com>
+Date: Sun, 16 Aug 2026 21:17:58 +0800
+Subject: [PATCH 3/6] x86: add QuarkCompat userspace compatibility layer
+
+Add optional user-mode emulation for integer CMOVcc, x87 FCMOVcc and
+FCOMI-family instructions on Intel Quark and other 32-bit processors
+without the CMOV CPUID feature. Also recover the common PIC ADD form of
+the Quark X1000 LOCK page-fault erratum and expose runtime counters
+through a misc device.
+
+Linux 6.12 uses kmalloc(sizeof(*work), GFP_ATOMIC) rather than the
+newer kmalloc_obj() helper, so use the 6.12 form here.
+
+Signed-off-by: jsjsjsjsjsjsjson <chara8892@gmail.com>
+---
+ arch/x86/Kconfig               |   26 +
+ arch/x86/kernel/Makefile       |    1 +
+ arch/x86/kernel/quark_compat.c | 1023 ++++++++++++++++++++++++++++++++
+ 3 files changed, 1050 insertions(+)
+ create mode 100644 arch/x86/kernel/quark_compat.c
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index d1c73d5ed..f6331f52b 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -911,6 +911,32 @@ endif # HYPERVISOR_GUEST
+ 
+ source "arch/x86/Kconfig.cpu"
+ 
++config X86_QUARK_COMPAT
++	tristate "QuarkCompat userspace compatibility layer"
++	depends on X86_32 && !X86_CMOV
++	help
++	  Emulate the i686 integer CMOVcc, x87 FCMOVcc and x87
++	  FCOMI/FUCOMI/FCOMIP/FUCOMIP instruction families when a 32-bit user
++	  process executes them on an i586-class processor which lacks CMOV.
++	  This is useful for processors such as Intel Quark X1000 when running
++	  an i686 userspace.
++
++	  The integer emulator handles all condition codes, register and memory
++	  sources, 16-bit and 32-bit operands and addresses, SIB addressing,
++	  and normal Linux GDT TLS segments.  The x87 emulator covers all
++	  register encodings in the CMOV CPUID feature group.  On Quark X1000,
++	  it can also recover the common PIC-code form of the LOCK-prefix page
++	  fault erratum by retrying the atomic instruction without LOCK.
++	  Runtime counters are available from /dev/quark_compat_stats.
++
++	  Select M to build quark_compat.ko, which must be loaded by an
++	  i586-compatible initramfs before starting any i686 executable.
++	  Select Y to make the emulator available before the first userspace
++	  process is started.
++
++	  This option does not emulate other instructions introduced with
++	  i686.  If unsure, say N.
++
+ config HPET_TIMER
+ 	def_bool X86_64
+ 	prompt "HPET Timer Support" if X86_32
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 5f58b5a38..d4cc562d2 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-y			+= ebda.o
+ obj-y			+= platform-quirks.o
+ obj-y			+= process_$(BITS).o signal.o signal_$(BITS).o
+ obj-y			+= traps.o idt.o irq.o irq_$(BITS).o dumpstack_$(BITS).o
++obj-$(CONFIG_X86_QUARK_COMPAT) += quark_compat.o
+ obj-y			+= time.o ioport.o dumpstack.o nmi.o
+ obj-$(CONFIG_X86_FRED)	+= fred.o
+ obj-$(CONFIG_MODIFY_LDT_SYSCALL)	+= ldt.o
+diff --git a/arch/x86/kernel/quark_compat.c b/arch/x86/kernel/quark_compat.c
+new file mode 100644
+index 000000000..f021cd5db
+--- /dev/null
++++ b/arch/x86/kernel/quark_compat.c
+@@ -0,0 +1,1023 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Emulate 16-bit and 32-bit CMOVcc instructions for 32-bit x86 CPUs which
++ * raise #UD for the i686 CMOV instruction family.
++ *
++ * This is deliberately an out-of-tree compatibility module.  It hooks the
++ * x86 die notifier, handles only user-mode #UD, and advances the saved EIP
++ * after a successfully emulated instruction.
++ */
++
++#include <linux/atomic.h>
++#include <linux/init.h>
++#include <linux/kdebug.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/notifier.h>
++#include <linux/pagemap.h>
++#include <linux/sched/signal.h>
++#include <linux/slab.h>
++#include <linux/task_work.h>
++#include <linux/uaccess.h>
++
++#include <asm/cpufeature.h>
++#include <asm/cpu_device_id.h>
++#include <asm/desc.h>
++#include <asm/fpu/api.h>
++#include <asm/processor-flags.h>
++#include <asm/ptrace.h>
++#include <asm/segment.h>
++#include <asm/traps.h>
++
++#ifndef CONFIG_X86_32
++#error "QuarkCompat is intended for a 32-bit x86 kernel"
++#endif
++
++#define CMOV_MAX_INSN_LEN 15
++#define QUARK_LOCK_NOT_PRESENT_ERROR 0xffff0006UL
++#define QUARK_LOCK_PROTECTION_ERROR  0xffff0007UL
++
++enum cmov_seg {
++	CMOV_SEG_ES,
++	CMOV_SEG_CS,
++	CMOV_SEG_SS,
++	CMOV_SEG_DS,
++	CMOV_SEG_FS,
++	CMOV_SEG_GS,
++};
++
++struct cmov_stream {
++	const u8 __user *ip;
++	u8 len;
++};
++
++struct cmov_decoded {
++	u8 len;
++	u8 cc;
++	u8 dst;
++	u8 src;
++	u8 width;
++	bool memory;
++	u32 offset;
++	enum cmov_seg seg;
++};
++
++struct cmov_seg_desc {
++	u32 base;
++	u32 limit;
++	bool expand_down;
++	bool default_32bit;
++};
++
++static atomic64_t trap_count = ATOMIC64_INIT(0);
++static atomic64_t emulated_count = ATOMIC64_INIT(0);
++static atomic64_t x87_emulated_count = ATOMIC64_INIT(0);
++static atomic64_t fault_count = ATOMIC64_INIT(0);
++static atomic64_t deferred_count = ATOMIC64_INIT(0);
++static atomic64_t lock_fault_count = ATOMIC64_INIT(0);
++static atomic64_t lock_recovered_count = ATOMIC64_INIT(0);
++static atomic64_t lock_unrecoverable_count = ATOMIC64_INIT(0);
++static atomic_t module_pinned = ATOMIC_INIT(0);
++
++static bool verbose;
++module_param(verbose, bool, 0644);
++MODULE_PARM_DESC(verbose, "log each successful emulation or erratum recovery");
++
++static int cmov_get_byte(struct cmov_stream *s, u8 *value)
++{
++	if (s->len >= CMOV_MAX_INSN_LEN)
++		return -EINVAL;
++	if (copy_from_user_nofault(value, s->ip + s->len, sizeof(*value)))
++		return -EFAULT;
++	s->len++;
++	return 0;
++}
++
++static int cmov_get_u16(struct cmov_stream *s, u16 *value)
++{
++	u8 lo, hi;
++
++	if (cmov_get_byte(s, &lo) || cmov_get_byte(s, &hi))
++		return -EFAULT;
++	*value = lo | ((u16)hi << 8);
++	return 0;
++}
++
++static int cmov_get_u32(struct cmov_stream *s, u32 *value)
++{
++	u16 lo, hi;
++
++	if (cmov_get_u16(s, &lo) || cmov_get_u16(s, &hi))
++		return -EFAULT;
++	*value = lo | ((u32)hi << 16);
++	return 0;
++}
++
++static u32 cmov_get_reg(const struct pt_regs *regs, unsigned int reg)
++{
++	switch (reg) {
++	case 0: return regs->ax;
++	case 1: return regs->cx;
++	case 2: return regs->dx;
++	case 3: return regs->bx;
++	case 4: return regs->sp;
++	case 5: return regs->bp;
++	case 6: return regs->si;
++	default: return regs->di;
++	}
++}
++
++static void cmov_set_reg(struct pt_regs *regs, unsigned int reg, u32 value,
++			 unsigned int width)
++{
++	unsigned long *dst;
++
++	switch (reg) {
++	case 0:
++		dst = &regs->ax;
++		break;
++	case 1:
++		dst = &regs->cx;
++		break;
++	case 2:
++		dst = &regs->dx;
++		break;
++	case 3:
++		dst = &regs->bx;
++		break;
++	case 4:
++		dst = &regs->sp;
++		break;
++	case 5:
++		dst = &regs->bp;
++		break;
++	case 6:
++		dst = &regs->si;
++		break;
++	default:
++		dst = &regs->di;
++		break;
++	}
++
++	if (width == 2)
++		*dst = (*dst & 0xffff0000UL) | (value & 0xffff);
++	else
++		*dst = value;
++}
++
++static bool cmov_condition(unsigned int cc, unsigned long flags)
++{
++	bool cf = flags & X86_EFLAGS_CF;
++	bool pf = flags & X86_EFLAGS_PF;
++	bool zf = flags & X86_EFLAGS_ZF;
++	bool sf = flags & X86_EFLAGS_SF;
++	bool of = flags & X86_EFLAGS_OF;
++
++	switch (cc) {
++	case 0x0: return of;
++	case 0x1: return !of;
++	case 0x2: return cf;
++	case 0x3: return !cf;
++	case 0x4: return zf;
++	case 0x5: return !zf;
++	case 0x6: return cf || zf;
++	case 0x7: return !cf && !zf;
++	case 0x8: return sf;
++	case 0x9: return !sf;
++	case 0xa: return pf;
++	case 0xb: return !pf;
++	case 0xc: return sf != of;
++	case 0xd: return sf == of;
++	case 0xe: return zf || sf != of;
++	default:  return !zf && sf == of;
++	}
++}
++
++static enum cmov_seg cmov_default_seg_32(unsigned int base_reg,
++					 bool have_base)
++{
++	if (have_base && (base_reg == 4 || base_reg == 5))
++		return CMOV_SEG_SS;
++	return CMOV_SEG_DS;
++}
++
++static int cmov_decode_ea32(struct cmov_stream *s,
++			    const struct pt_regs *regs, u8 modrm,
++			    u32 *offset, enum cmov_seg *default_seg)
++{
++	u8 mod = modrm >> 6;
++	u8 rm = modrm & 7;
++	u8 base_reg = rm;
++	u32 base = 0, index = 0, displacement = 0;
++	bool have_base = true;
++
++	if (rm == 4) {
++		u8 sib, scale, index_reg;
++
++		if (cmov_get_byte(s, &sib))
++			return -EFAULT;
++		scale = sib >> 6;
++		index_reg = (sib >> 3) & 7;
++		base_reg = sib & 7;
++		if (index_reg != 4)
++			index = cmov_get_reg(regs, index_reg) << scale;
++		if (mod == 0 && base_reg == 5)
++			have_base = false;
++	} else if (mod == 0 && rm == 5) {
++		have_base = false;
++	}
++
++	if (have_base)
++		base = cmov_get_reg(regs, base_reg);
++
++	if (mod == 0 && !have_base) {
++		if (cmov_get_u32(s, &displacement))
++			return -EFAULT;
++	} else if (mod == 1) {
++		u8 disp8;
++
++		if (cmov_get_byte(s, &disp8))
++			return -EFAULT;
++		displacement = (s32)(s8)disp8;
++	} else if (mod == 2) {
++		if (cmov_get_u32(s, &displacement))
++			return -EFAULT;
++	}
++
++	*offset = base + index + displacement;
++	*default_seg = cmov_default_seg_32(base_reg, have_base);
++	return 0;
++}
++
++static int cmov_decode_ea16(struct cmov_stream *s,
++			    const struct pt_regs *regs, u8 modrm,
++			    u32 *offset, enum cmov_seg *default_seg)
++{
++	u8 mod = modrm >> 6;
++	u8 rm = modrm & 7;
++	u16 address = 0, disp16;
++
++	switch (rm) {
++	case 0:
++		address = regs->bx + regs->si;
++		break;
++	case 1:
++		address = regs->bx + regs->di;
++		break;
++	case 2:
++		address = regs->bp + regs->si;
++		break;
++	case 3:
++		address = regs->bp + regs->di;
++		break;
++	case 4:
++		address = regs->si;
++		break;
++	case 5:
++		address = regs->di;
++		break;
++	case 6:
++		if (mod != 0)
++			address = regs->bp;
++		break;
++	default:
++		address = regs->bx;
++		break;
++	}
++
++	*default_seg = ((rm == 2 || rm == 3) || (rm == 6 && mod != 0)) ?
++			CMOV_SEG_SS : CMOV_SEG_DS;
++
++	if (mod == 0 && rm == 6) {
++		if (cmov_get_u16(s, &disp16))
++			return -EFAULT;
++		address = disp16;
++	} else if (mod == 1) {
++		u8 disp8;
++
++		if (cmov_get_byte(s, &disp8))
++			return -EFAULT;
++		address += (s8)disp8;
++	} else if (mod == 2) {
++		if (cmov_get_u16(s, &disp16))
++			return -EFAULT;
++		address += disp16;
++	}
++
++	*offset = address;
++	return 0;
++}
++
++/*
++ * Return 0 only for a fully decoded CMOVcc.  Any other #UD is left to the
++ * normal kernel handler.  Linux i386 user code has a 32-bit default operand
++ * and address size; vm86 and non-32-bit code segments are rejected earlier.
++ */
++static int cmov_decode(struct pt_regs *regs, struct cmov_decoded *insn)
++{
++	struct cmov_stream s = {
++		.ip = (const u8 __user *)regs->ip,
++	};
++	enum cmov_seg override = CMOV_SEG_DS;
++	bool have_override = false;
++	bool operand_16 = false, address_16 = false, lock = false;
++	u8 byte, opcode, modrm, mod;
++
++	for (;;) {
++		if (cmov_get_byte(&s, &byte))
++			return -EFAULT;
++		switch (byte) {
++		case 0x26:
++			override = CMOV_SEG_ES;
++			have_override = true;
++			continue;
++		case 0x2e:
++			override = CMOV_SEG_CS;
++			have_override = true;
++			continue;
++		case 0x36:
++			override = CMOV_SEG_SS;
++			have_override = true;
++			continue;
++		case 0x3e:
++			override = CMOV_SEG_DS;
++			have_override = true;
++			continue;
++		case 0x64:
++			override = CMOV_SEG_FS;
++			have_override = true;
++			continue;
++		case 0x65:
++			override = CMOV_SEG_GS;
++			have_override = true;
++			continue;
++		case 0x66:
++			operand_16 = true;
++			continue;
++		case 0x67:
++			address_16 = true;
++			continue;
++		case 0xf0:
++			lock = true;
++			continue;
++		case 0xf2:
++		case 0xf3:
++			continue;
++		default:
++			break;
++		}
++		break;
++	}
++
++	if (byte != 0x0f || lock)
++		return -ENOEXEC;
++	if (cmov_get_byte(&s, &opcode) || opcode < 0x40 || opcode > 0x4f)
++		return -ENOEXEC;
++	if (cmov_get_byte(&s, &modrm))
++		return -EFAULT;
++
++	mod = modrm >> 6;
++	insn->cc = opcode & 0xf;
++	insn->dst = (modrm >> 3) & 7;
++	insn->src = modrm & 7;
++	insn->width = operand_16 ? 2 : 4;
++	insn->memory = mod != 3;
++
++	if (insn->memory) {
++		enum cmov_seg default_seg;
++		int ret;
++
++		if (address_16)
++			ret = cmov_decode_ea16(&s, regs, modrm, &insn->offset,
++					       &default_seg);
++		else
++			ret = cmov_decode_ea32(&s, regs, modrm, &insn->offset,
++					       &default_seg);
++		if (ret)
++			return ret;
++		insn->seg = have_override ? override : default_seg;
++	}
++
++	insn->len = s.len;
++	return 0;
++}
++
++static u16 cmov_segment_selector(const struct pt_regs *regs, enum cmov_seg seg)
++{
++	u16 selector;
++
++	switch (seg) {
++	case CMOV_SEG_ES: return regs->es;
++	case CMOV_SEG_CS: return regs->cs;
++	case CMOV_SEG_SS: return regs->ss;
++	case CMOV_SEG_DS: return regs->ds;
++	case CMOV_SEG_FS: return regs->fs;
++	default:
++		savesegment(gs, selector);
++		return selector;
++	}
++}
++
++static int cmov_get_segment(const struct pt_regs *regs, enum cmov_seg seg,
++			    struct cmov_seg_desc *result)
++{
++	struct desc_ptr gdt;
++	struct desc_struct desc;
++	u16 selector = cmov_segment_selector(regs, seg);
++	unsigned int offset = selector & ~7U;
++
++	/* LDT lookup needs locking and is intentionally not done in a die hook. */
++	if (!selector || (selector & SEGMENT_TI_MASK))
++		return -EOPNOTSUPP;
++
++	store_gdt(&gdt);
++	if (offset + sizeof(desc) - 1 > gdt.size)
++		return -EINVAL;
++	desc = *(const struct desc_struct *)(gdt.address + offset);
++	if (!desc.p || !desc.s)
++		return -EINVAL;
++	/* A code segment must be readable to be used as a data source. */
++	if ((desc.type & BIT(3)) && !(desc.type & BIT(1)))
++		return -EACCES;
++
++	result->base = get_desc_base(&desc);
++	result->limit = get_desc_limit(&desc);
++	if (desc.g)
++		result->limit = (result->limit << 12) | 0xfff;
++	result->expand_down = !(desc.type & BIT(3)) && (desc.type & BIT(2));
++	result->default_32bit = desc.d;
++	return 0;
++}
++
++static bool cmov_segment_contains(const struct cmov_seg_desc *seg, u32 offset,
++				  unsigned int width)
++{
++	u32 last = offset + width - 1;
++
++	if (last < offset)
++		return false;
++	if (!seg->expand_down)
++		return last <= seg->limit;
++
++	return offset > seg->limit &&
++		last <= (seg->default_32bit ? U32_MAX : U16_MAX);
++}
++
++struct cmov_pagein_work {
++	struct callback_head work;
++	const void __user *address;
++	size_t size;
++};
++
++static void cmov_pagein_task_work(struct callback_head *callback)
++{
++	struct cmov_pagein_work *work =
++		container_of(callback, struct cmov_pagein_work, work);
++
++	/* This runs on the return-to-userspace path and is allowed to sleep. */
++	if (fault_in_readable((const char __user *)work->address, work->size)) {
++		atomic64_inc(&fault_count);
++		force_sig(SIGSEGV);
++	}
++	kfree(work);
++}
++
++/*
++ * task_work_add() is not exported to modules.  This is its TWA_RESUME case,
++ * specialized for current: publish a callback on current->task_works and set
++ * TIF_NOTIFY_RESUME.  A task executing a user #UD cannot be in exit_task_work,
++ * so the private work_exited sentinel cannot be present here.
++ */
++static int cmov_defer_pagein(const void __user *address, size_t size)
++{
++	struct cmov_pagein_work *work;
++	struct callback_head *head;
++
++	work = kmalloc(sizeof(*work), GFP_ATOMIC);
++	if (!work)
++		return -ENOMEM;
++
++	/*
++	 * A queued callback points into this module.  Pin it permanently on the
++	 * first deferred page-in; a boot compatibility module should stay loaded
++	 * while the i686 userspace is running.
++	 */
++	if (atomic_cmpxchg(&module_pinned, 0, 1) == 0 &&
++	    !try_module_get(THIS_MODULE)) {
++		atomic_set(&module_pinned, 0);
++		kfree(work);
++		return -ENODEV;
++	}
++
++	init_task_work(&work->work, cmov_pagein_task_work);
++	work->address = address;
++	work->size = size;
++	head = READ_ONCE(current->task_works);
++	do {
++		work->work.next = head;
++	} while (!try_cmpxchg(&current->task_works, &head, &work->work));
++	set_tsk_thread_flag(current, TIF_NOTIFY_RESUME);
++	atomic64_inc(&deferred_count);
++	return 0;
++}
++
++static bool cmov_x87_condition(unsigned int condition, unsigned long flags)
++{
++	switch (condition) {
++	case 0:
++		return flags & X86_EFLAGS_CF;
++	case 1:
++		return flags & X86_EFLAGS_ZF;
++	case 2:
++		return flags & (X86_EFLAGS_CF | X86_EFLAGS_ZF);
++	case 3:
++		return flags & X86_EFLAGS_PF;
++	case 4:
++		return !(flags & X86_EFLAGS_CF);
++	case 5:
++		return !(flags & X86_EFLAGS_ZF);
++	case 6:
++		return !(flags & (X86_EFLAGS_CF | X86_EFLAGS_ZF));
++	default:
++		return !(flags & X86_EFLAGS_PF);
++	}
++}
++
++static void cmov_x87_move(unsigned int reg)
++{
++	/* FXCH ST(i); FST ST(i); FXCH ST(i), without needing a free stack slot. */
++	switch (reg) {
++	case 0:
++		asm volatile(".byte 0xd9, 0xc8; .byte 0xdd, 0xd0; .byte 0xd9, 0xc8");
++		break;
++	case 1:
++		asm volatile(".byte 0xd9, 0xc9; .byte 0xdd, 0xd1; .byte 0xd9, 0xc9");
++		break;
++	case 2:
++		asm volatile(".byte 0xd9, 0xca; .byte 0xdd, 0xd2; .byte 0xd9, 0xca");
++		break;
++	case 3:
++		asm volatile(".byte 0xd9, 0xcb; .byte 0xdd, 0xd3; .byte 0xd9, 0xcb");
++		break;
++	case 4:
++		asm volatile(".byte 0xd9, 0xcc; .byte 0xdd, 0xd4; .byte 0xd9, 0xcc");
++		break;
++	case 5:
++		asm volatile(".byte 0xd9, 0xcd; .byte 0xdd, 0xd5; .byte 0xd9, 0xcd");
++		break;
++	case 6:
++		asm volatile(".byte 0xd9, 0xce; .byte 0xdd, 0xd6; .byte 0xd9, 0xce");
++		break;
++	default:
++		asm volatile(".byte 0xd9, 0xcf; .byte 0xdd, 0xd7; .byte 0xd9, 0xcf");
++		break;
++	}
++}
++
++static u16 cmov_x87_compare(unsigned int reg, bool unordered)
++{
++	u16 status;
++
++	switch (reg) {
++	case 0:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe0; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd0; fnstsw %%ax" : "=a" (status));
++		break;
++	case 1:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe1; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd1; fnstsw %%ax" : "=a" (status));
++		break;
++	case 2:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe2; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd2; fnstsw %%ax" : "=a" (status));
++		break;
++	case 3:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe3; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd3; fnstsw %%ax" : "=a" (status));
++		break;
++	case 4:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe4; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd4; fnstsw %%ax" : "=a" (status));
++		break;
++	case 5:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe5; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd5; fnstsw %%ax" : "=a" (status));
++		break;
++	case 6:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe6; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd6; fnstsw %%ax" : "=a" (status));
++		break;
++	default:
++		if (unordered)
++			asm volatile(".byte 0xdd, 0xe7; fnstsw %%ax" : "=a" (status));
++		else
++			asm volatile(".byte 0xd8, 0xd7; fnstsw %%ax" : "=a" (status));
++		break;
++	}
++	return status;
++}
++
++static unsigned long cmov_x87_status_to_flags(u16 status)
++{
++	unsigned long flags = 0;
++
++	if (status & BIT(8))
++		flags |= X86_EFLAGS_CF;
++	if (status & BIT(10))
++		flags |= X86_EFLAGS_PF;
++	if (status & BIT(14))
++		flags |= X86_EFLAGS_ZF;
++	return flags;
++}
++
++/*
++ * FCMOVcc and F(U)COMI(P) are part of the same CPUID CMOV feature bit as
++ * integer CMOV.  Return true only when @opcode is one of those two-byte x87
++ * register encodings and has been emulated.
++ */
++static bool quark_compat_emulate_x87(struct pt_regs *regs, u8 primary,
++				     u8 opcode)
++{
++	const unsigned long arithmetic_flags = X86_EFLAGS_OF | X86_EFLAGS_SF |
++		X86_EFLAGS_ZF | X86_EFLAGS_AF | X86_EFLAGS_PF | X86_EFLAGS_CF;
++	unsigned int reg = opcode & 7;
++	unsigned int condition;
++	unsigned long new_flags;
++	u16 control, masked_control, status;
++	bool compare, unordered, pop;
++
++	compare = (primary == 0xdb || primary == 0xdf) && opcode >= 0xe8;
++	if (!compare) {
++		if (primary == 0xda && opcode >= 0xc0 && opcode <= 0xdf)
++			condition = (opcode - 0xc0) >> 3;
++		else if (primary == 0xdb && opcode >= 0xc0 && opcode <= 0xdf)
++			condition = 4 + ((opcode - 0xc0) >> 3);
++		else
++			return false;
++	} else if (opcode > 0xf7) {
++		return false;
++	}
++
++	if (!irq_fpu_usable())
++		return false;
++
++	fpregs_lock_and_load();
++	asm volatile("fnstcw %0" : "=m" (control));
++	/* Avoid taking a kernel-mode #MF while operating on the user x87 stack. */
++	if ((control & 0x3f) != 0x3f) {
++		fpregs_unlock();
++		return false;
++	}
++	masked_control = control | 0x3f;
++	asm volatile("fldcw %0" : : "m" (masked_control));
++
++	if (!compare) {
++		if (cmov_x87_condition(condition, regs->flags))
++			cmov_x87_move(reg);
++	} else {
++		unordered = opcode < 0xf0;
++		pop = primary == 0xdf;
++		status = cmov_x87_compare(reg, unordered);
++		new_flags = cmov_x87_status_to_flags(status);
++		regs->flags = (regs->flags & ~arithmetic_flags) | new_flags;
++		if (pop)
++			asm volatile(".byte 0xdd, 0xd8"); /* FSTP ST(0) */
++	}
++
++	asm volatile("fldcw %0" : : "m" (control));
++	fpregs_unlock();
++	regs->ip += 2;
++	atomic64_inc(&trap_count);
++	atomic64_inc(&emulated_count);
++	atomic64_inc(&x87_emulated_count);
++	return true;
++}
++
++static bool quark_lock_opcode(const u8 __user *ip)
++{
++	struct cmov_stream s = { .ip = ip + 1 };
++	u8 opcode, modrm, operation;
++
++	/* Skip prefixes which may legally follow LOCK. */
++	for (;;) {
++		if (cmov_get_byte(&s, &opcode))
++			return false;
++		switch (opcode) {
++		case 0x26:
++		case 0x2e:
++		case 0x36:
++		case 0x3e:
++		case 0x64:
++		case 0x65:
++		case 0x66:
++		case 0x67:
++			continue;
++		default:
++			break;
++		}
++		break;
++	}
++
++	if (opcode == 0x0f) {
++		if (cmov_get_byte(&s, &opcode) || cmov_get_byte(&s, &modrm))
++			return false;
++		operation = (modrm >> 3) & 7;
++		switch (opcode) {
++		case 0xab: /* BTS */
++		case 0xb0: /* CMPXCHG byte */
++		case 0xb1: /* CMPXCHG word/dword */
++		case 0xb3: /* BTR */
++		case 0xbb: /* BTC */
++		case 0xc0: /* XADD byte */
++		case 0xc1: /* XADD word/dword */
++			break;
++		case 0xba: /* BTS/BTR/BTC immediate */
++			if (operation < 5)
++				return false;
++			break;
++		case 0xc7: /* CMPXCHG8B */
++			if (operation != 1)
++				return false;
++			break;
++		default:
++			return false;
++		}
++	} else {
++		if (cmov_get_byte(&s, &modrm))
++			return false;
++		operation = (modrm >> 3) & 7;
++		switch (opcode) {
++		case 0x00: /* ADD */
++		case 0x01:
++		case 0x08: /* OR */
++		case 0x09:
++		case 0x20: /* AND */
++		case 0x21:
++		case 0x28: /* SUB */
++		case 0x29:
++		case 0x30: /* XOR */
++		case 0x31:
++		case 0x86: /* XCHG */
++		case 0x87:
++			break;
++		case 0x80:
++		case 0x81:
++		case 0x83:
++			/* Exclude ADC, SBB and CMP. */
++			if (operation == 2 || operation == 3 || operation == 7)
++				return false;
++			break;
++		case 0xf6: /* NOT/NEG */
++		case 0xf7:
++			if (operation != 2 && operation != 3)
++				return false;
++			break;
++		case 0xfe: /* INC/DEC */
++		case 0xff:
++			if (operation > 1)
++				return false;
++			break;
++		default:
++			return false;
++		}
++	}
++
++	/* LOCK with a register destination is invalid and cannot be this erratum. */
++	return (modrm >> 6) != 3;
++}
++
++/*
++ * Quark erratum 71538 re-executes the instruction before a LOCKed operation
++ * when that operation raises a page fault.  PIC code commonly places
++ * "add imm32, %reg" immediately before its first atomic GOT access.  Undo the
++ * duplicate ADD, skip LOCK, and let the unlocked operation take an ordinary
++ * COW/not-present fault on retry.  Omitting LOCK is Intel's documented
++ * uniprocessor workaround.
++ */
++static bool quark_rollback_pic_add(struct pt_regs *regs)
++{
++	u8 bytes[6];
++	u32 immediate;
++	unsigned int reg;
++
++	if (regs->ip < sizeof(bytes) ||
++	    copy_from_user_nofault(bytes,
++				   (const void __user *)(regs->ip - sizeof(bytes)),
++				   sizeof(bytes)))
++		return false;
++	if (bytes[0] != 0x81 || (bytes[1] & 0xf8) != 0xc0)
++		return false;
++
++	reg = bytes[1] & 7;
++	immediate = bytes[2] | ((u32)bytes[3] << 8) |
++		    ((u32)bytes[4] << 16) | ((u32)bytes[5] << 24);
++	cmov_set_reg(regs, reg, cmov_get_reg(regs, reg) - immediate, 4);
++	return true;
++}
++
++static int quark_lock_fault(struct pt_regs *regs, unsigned long error_code)
++{
++	u8 prefix;
++
++	if (boot_cpu_data.x86_vfm != INTEL_QUARK_X1000 ||
++	    (error_code != QUARK_LOCK_NOT_PRESENT_ERROR &&
++	     error_code != QUARK_LOCK_PROTECTION_ERROR) || !user_mode(regs) ||
++	    copy_from_user_nofault(&prefix, (const void __user *)regs->ip,
++				   sizeof(prefix)) || prefix != 0xf0 ||
++	    !quark_lock_opcode((const u8 __user *)regs->ip))
++		return NOTIFY_DONE;
++
++	atomic64_inc(&lock_fault_count);
++	if (!quark_rollback_pic_add(regs)) {
++		atomic64_inc(&lock_unrecoverable_count);
++		pr_warn_ratelimited("pid %d: cannot safely recover Quark LOCK fault at %#lx\n",
++				    task_pid_nr(current), regs->ip);
++		return NOTIFY_DONE;
++	}
++
++	/* Retry the read-modify-write instruction without its LOCK prefix. */
++	regs->ip++;
++	atomic64_inc(&lock_recovered_count);
++	if (verbose)
++		pr_info_ratelimited("pid %d: recovered Quark LOCK fault at %#lx\n",
++				    task_pid_nr(current), regs->ip - 1);
++	return NOTIFY_STOP;
++}
++
++static ssize_t quark_compat_stats_read(struct file *file,
++				       char __user *user_buffer, size_t count,
++				       loff_t *position)
++{
++	char buffer[384];
++	int length;
++
++	length = scnprintf(buffer, sizeof(buffer),
++			   "emulated=%lld\nx87_emulated=%lld\ntraps=%lld\ndeferred_pageins=%lld\nsource_faults=%lld\nlock_faults=%lld\nlock_recovered=%lld\nlock_unrecoverable=%lld\n",
++			   (long long)atomic64_read(&emulated_count),
++			   (long long)atomic64_read(&x87_emulated_count),
++			   (long long)atomic64_read(&trap_count),
++			   (long long)atomic64_read(&deferred_count),
++			   (long long)atomic64_read(&fault_count),
++			   (long long)atomic64_read(&lock_fault_count),
++			   (long long)atomic64_read(&lock_recovered_count),
++			   (long long)atomic64_read(&lock_unrecoverable_count));
++	return simple_read_from_buffer(user_buffer, count, position, buffer,
++				       length);
++}
++
++static const struct file_operations quark_compat_stats_fops = {
++	.owner = THIS_MODULE,
++	.read = quark_compat_stats_read,
++	.llseek = noop_llseek,
++};
++
++static struct miscdevice quark_compat_stats_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "quark_compat_stats",
++	.fops = &quark_compat_stats_fops,
++	.mode = 0444,
++};
++
++static int cmov_read_source(const struct pt_regs *regs,
++			    const struct cmov_decoded *insn, u32 *value)
++{
++	struct cmov_seg_desc seg;
++	const void __user *address;
++	u16 value16;
++	int ret;
++
++	if (!insn->memory) {
++		*value = cmov_get_reg(regs, insn->src);
++		return 0;
++	}
++
++	ret = cmov_get_segment(regs, insn->seg, &seg);
++	if (ret)
++		return ret;
++	if (!cmov_segment_contains(&seg, insn->offset, insn->width))
++		return -EFAULT;
++
++	address = (const void __user *)(unsigned long)(seg.base + insn->offset);
++	if (insn->width == 2) {
++		if (copy_from_user_nofault(&value16, address, sizeof(value16)))
++			return cmov_defer_pagein(address, sizeof(value16)) ?
++				-EFAULT : -EAGAIN;
++		*value = value16;
++	} else if (copy_from_user_nofault(value, address, sizeof(*value))) {
++		return cmov_defer_pagein(address, sizeof(*value)) ?
++			-EFAULT : -EAGAIN;
++	}
++	return 0;
++}
++
++static int quark_compat_die_notify(struct notifier_block *nb,
++				   unsigned long val, void *data)
++{
++	struct die_args *args = data;
++	struct cmov_decoded insn;
++	struct pt_regs *regs;
++	u8 x87_opcode[2];
++	u32 source;
++	int ret;
++
++	if (val == DIE_PAGE_FAULT)
++		return quark_lock_fault(args->regs, args->err);
++	if (val != DIE_TRAP || args->trapnr != X86_TRAP_UD)
++		return NOTIFY_DONE;
++	regs = args->regs;
++	if (!user_mode(regs) || v8086_mode(regs))
++		return NOTIFY_DONE;
++	if (!copy_from_user_nofault(x87_opcode, (const void __user *)regs->ip,
++				    sizeof(x87_opcode)) &&
++	    quark_compat_emulate_x87(regs, x87_opcode[0], x87_opcode[1]))
++		return NOTIFY_STOP;
++
++	ret = cmov_decode(regs, &insn);
++	if (ret)
++		return NOTIFY_DONE;
++	atomic64_inc(&trap_count);
++
++	/* Real CMOV reads a memory source even when its condition is false. */
++	ret = cmov_read_source(regs, &insn, &source);
++	if (ret == -EAGAIN)
++		return NOTIFY_STOP;
++	if (ret == -EFAULT || ret == -EACCES || ret == -EINVAL) {
++		atomic64_inc(&fault_count);
++		force_sig(SIGSEGV);
++		return NOTIFY_STOP;
++	}
++	if (ret)
++		return NOTIFY_DONE;
++
++	if (cmov_condition(insn.cc, regs->flags))
++		cmov_set_reg(regs, insn.dst, source, insn.width);
++	regs->ip += insn.len;
++	atomic64_inc(&emulated_count);
++	if (verbose)
++		pr_info_ratelimited("pid %d: emulated CMOV%x at %#lx\n",
++				    task_pid_nr(current), insn.cc,
++				    regs->ip - insn.len);
++	return NOTIFY_STOP;
++}
++
++static struct notifier_block quark_compat_die_notifier = {
++	.notifier_call = quark_compat_die_notify,
++};
++
++static int __init quark_compat_init(void)
++{
++	int ret;
++
++	ret = misc_register(&quark_compat_stats_device);
++	if (ret)
++		return ret;
++
++	ret = register_die_notifier(&quark_compat_die_notifier);
++	if (ret) {
++		misc_deregister(&quark_compat_stats_device);
++		return ret;
++	}
++
++	if (boot_cpu_has(X86_FEATURE_CMOV))
++		pr_warn("CPU already advertises CMOV; the #UD hook should stay idle\n");
++	if (boot_cpu_data.x86_vfm == INTEL_QUARK_X1000)
++		pr_info("Quark LOCK-prefix page-fault recovery enabled\n");
++	pr_info("QuarkCompat loaded: userspace compatibility enabled; stats at /dev/%s\n",
++		quark_compat_stats_device.name);
++	return 0;
++}
++
++static void __exit quark_compat_exit(void)
++{
++	unregister_die_notifier(&quark_compat_die_notifier);
++	misc_deregister(&quark_compat_stats_device);
++	pr_info("QuarkCompat unloaded: %lld instructions emulated, %lld traps, %lld deferred page-ins, %lld source faults, %lld/%lld LOCK faults recovered\n",
++		(long long)atomic64_read(&emulated_count),
++		(long long)atomic64_read(&trap_count),
++		(long long)atomic64_read(&deferred_count),
++		(long long)atomic64_read(&fault_count),
++		(long long)atomic64_read(&lock_recovered_count),
++		(long long)atomic64_read(&lock_fault_count));
++}
++
++module_init(quark_compat_init);
++module_exit(quark_compat_exit);
++
++MODULE_AUTHOR("libchara");
++MODULE_DESCRIPTION("QuarkCompat userspace compatibility layer for Intel Quark");
++MODULE_LICENSE("GPL");

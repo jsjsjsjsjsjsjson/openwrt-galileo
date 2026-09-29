@@ -1,0 +1,142 @@
+From d64aea03b9a0b1afc99e59d140eb51f424115dd2 Mon Sep 17 00:00:00 2001
+From: jsjsjsjsjsjsjson <chara8892@gmail.com>
+Date: Mon, 17 Aug 2026 00:16:31 +0800
+Subject: [PATCH 4/6] x86/quark-compat: handle rewound EIP on LOCK fault
+
+Quark erratum 71538 can report the instruction preceding a faulting
+LOCKed operation as the saved EIP after replaying that instruction.  The
+existing recovery only recognizes an EIP which points directly at the
+LOCK prefix, so the duplicated PIC ADD and corrupted fault address escape
+to userspace as SIGSEGV.
+
+Recognize both forms of the exception frame.  When EIP points at the
+replayed ADD, verify that it is the supported six-byte PIC form and that a
+valid memory LOCK operation immediately follows it.  Roll back the
+duplicate addition and resume after the LOCK prefix, as for the existing
+recovery path.
+
+Signed-off-by: jsjsjsjsjsjsjson <chara8892@gmail.com>
+---
+ arch/x86/kernel/quark_compat.c | 82 ++++++++++++++++++++++------------
+ 1 file changed, 54 insertions(+), 28 deletions(-)
+
+diff --git a/arch/x86/kernel/quark_compat.c b/arch/x86/kernel/quark_compat.c
+index f021cd5db..d5db87eb5 100644
+--- a/arch/x86/kernel/quark_compat.c
++++ b/arch/x86/kernel/quark_compat.c
+@@ -801,61 +801,87 @@ static bool quark_lock_opcode(const u8 __user *ip)
+ 	return (modrm >> 6) != 3;
+ }
+ 
+-/*
+- * Quark erratum 71538 re-executes the instruction before a LOCKed operation
+- * when that operation raises a page fault.  PIC code commonly places
+- * "add imm32, %reg" immediately before its first atomic GOT access.  Undo the
+- * duplicate ADD, skip LOCK, and let the unlocked operation take an ordinary
+- * COW/not-present fault on retry.  Omitting LOCK is Intel's documented
+- * uniprocessor workaround.
+- */
+-static bool quark_rollback_pic_add(struct pt_regs *regs)
++static bool quark_lock_at(const u8 __user *ip)
++{
++	u8 prefix;
++
++	return !copy_from_user_nofault(&prefix, ip, sizeof(prefix)) &&
++	       prefix == 0xf0 && quark_lock_opcode(ip);
++}
++
++static bool quark_decode_pic_add(const u8 __user *ip, unsigned int *reg,
++				 u32 *immediate)
+ {
+ 	u8 bytes[6];
+-	u32 immediate;
+-	unsigned int reg;
+ 
+-	if (regs->ip < sizeof(bytes) ||
+-	    copy_from_user_nofault(bytes,
+-				   (const void __user *)(regs->ip - sizeof(bytes)),
+-				   sizeof(bytes)))
++	if (copy_from_user_nofault(bytes, ip, sizeof(bytes)))
+ 		return false;
+ 	if (bytes[0] != 0x81 || (bytes[1] & 0xf8) != 0xc0)
+ 		return false;
+ 
+-	reg = bytes[1] & 7;
+-	immediate = bytes[2] | ((u32)bytes[3] << 8) |
+-		    ((u32)bytes[4] << 16) | ((u32)bytes[5] << 24);
+-	cmov_set_reg(regs, reg, cmov_get_reg(regs, reg) - immediate, 4);
++	*reg = bytes[1] & 7;
++	*immediate = bytes[2] | ((u32)bytes[3] << 8) |
++		     ((u32)bytes[4] << 16) | ((u32)bytes[5] << 24);
+ 	return true;
+ }
+ 
++/*
++ * Quark erratum 71538 re-executes the instruction before a LOCKed operation
++ * when that operation raises a page fault.  PIC code commonly places
++ * "add imm32, %reg" immediately before its first atomic GOT access.  The
++ * saved EIP may identify either the LOCK prefix or the duplicated ADD.  Undo
++ * the duplicate ADD, skip LOCK, and let the unlocked operation take an
++ * ordinary COW/not-present fault on retry.  Omitting LOCK is Intel's
++ * documented uniprocessor workaround.
++ */
+ static int quark_lock_fault(struct pt_regs *regs, unsigned long error_code)
+ {
+-	u8 prefix;
++	const u8 __user *add_ip, *ip, *lock_ip;
++	u32 immediate;
++	unsigned int reg;
++	bool rewound_eip = false;
+ 
+ 	if (boot_cpu_data.x86_vfm != INTEL_QUARK_X1000 ||
+ 	    (error_code != QUARK_LOCK_NOT_PRESENT_ERROR &&
+-	     error_code != QUARK_LOCK_PROTECTION_ERROR) || !user_mode(regs) ||
+-	    copy_from_user_nofault(&prefix, (const void __user *)regs->ip,
+-				   sizeof(prefix)) || prefix != 0xf0 ||
+-	    !quark_lock_opcode((const u8 __user *)regs->ip))
++	     error_code != QUARK_LOCK_PROTECTION_ERROR) || !user_mode(regs))
+ 		return NOTIFY_DONE;
+ 
++	ip = (const u8 __user *)regs->ip;
++	if (quark_lock_at(ip)) {
++		if (regs->ip < 6)
++			return NOTIFY_DONE;
++		lock_ip = ip;
++		add_ip = ip - 6;
++	} else {
++		/*
++		 * On the erratum path EIP can point at the instruction which was
++		 * replayed, while the fault address was calculated after that ADD
++		 * had already modified its destination a second time.
++		 */
++		add_ip = ip;
++		lock_ip = ip + 6;
++		if (!quark_decode_pic_add(add_ip, &reg, &immediate) ||
++		    !quark_lock_at(lock_ip))
++			return NOTIFY_DONE;
++		rewound_eip = true;
++	}
++
+ 	atomic64_inc(&lock_fault_count);
+-	if (!quark_rollback_pic_add(regs)) {
++	if (!rewound_eip &&
++	    !quark_decode_pic_add(add_ip, &reg, &immediate)) {
+ 		atomic64_inc(&lock_unrecoverable_count);
+ 		pr_warn_ratelimited("pid %d: cannot safely recover Quark LOCK fault at %#lx\n",
+-				    task_pid_nr(current), regs->ip);
++				    task_pid_nr(current), (unsigned long)lock_ip);
+ 		return NOTIFY_DONE;
+ 	}
++	cmov_set_reg(regs, reg, cmov_get_reg(regs, reg) - immediate, 4);
+ 
+ 	/* Retry the read-modify-write instruction without its LOCK prefix. */
+-	regs->ip++;
++	regs->ip = (unsigned long)lock_ip + 1;
+ 	atomic64_inc(&lock_recovered_count);
+ 	if (verbose)
+ 		pr_info_ratelimited("pid %d: recovered Quark LOCK fault at %#lx\n",
+-				    task_pid_nr(current), regs->ip - 1);
++				    task_pid_nr(current), (unsigned long)lock_ip);
+ 	return NOTIFY_STOP;
+ }
+ 

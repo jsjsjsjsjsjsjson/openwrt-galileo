@@ -1,0 +1,234 @@
+From a85eb9c156733379edc687d45167ec8e0addbd92 Mon Sep 17 00:00:00 2001
+From: jsjsjsjsjsjsjson <chara8892@gmail.com>
+Date: Mon, 17 Aug 2026 00:40:25 +0800
+Subject: [PATCH 5/6] x86/quark-compat: resolve repaired LOCK faults in place
+
+Complete the corrected COW or not-present fault before returning to
+userspace so Quark cannot rewind the retry a second time.
+
+Derive the expected PIC register from the preceding get_pc_thunk call.
+Leave precise state untouched and roll back the register and CR2 only
+when the ADD is proven to have been replayed.  Ignore unrelated page
+faults which use the same sign-extended Quark error code.
+
+Signed-off-by: jsjsjsjsjsjsjson <chara8892@gmail.com>
+---
+ arch/x86/kernel/quark_compat.c | 105 ++++++++++++++++++++++++++-------
+ arch/x86/mm/fault.c            |  22 +++++--
+ 2 files changed, 101 insertions(+), 26 deletions(-)
+
+diff --git a/arch/x86/kernel/quark_compat.c b/arch/x86/kernel/quark_compat.c
+index d5db87eb5..a89c5bc18 100644
+--- a/arch/x86/kernel/quark_compat.c
++++ b/arch/x86/kernel/quark_compat.c
+@@ -708,10 +708,11 @@ static bool quark_compat_emulate_x87(struct pt_regs *regs, u8 primary,
+ 	return true;
+ }
+ 
+-static bool quark_lock_opcode(const u8 __user *ip)
++static bool quark_lock_opcode(const u8 __user *ip, unsigned int base_reg)
+ {
+ 	struct cmov_stream s = { .ip = ip + 1 };
+-	u8 opcode, modrm, operation;
++	u8 opcode, modrm, operation, sib;
++	bool address_16bit = false;
+ 
+ 	/* Skip prefixes which may legally follow LOCK. */
+ 	for (;;) {
+@@ -725,7 +726,9 @@ static bool quark_lock_opcode(const u8 __user *ip)
+ 		case 0x64:
+ 		case 0x65:
+ 		case 0x66:
++			continue;
+ 		case 0x67:
++			address_16bit = true;
+ 			continue;
+ 		default:
+ 			break;
+@@ -798,15 +801,37 @@ static bool quark_lock_opcode(const u8 __user *ip)
+ 	}
+ 
+ 	/* LOCK with a register destination is invalid and cannot be this erratum. */
+-	return (modrm >> 6) != 3;
++	if ((modrm >> 6) == 3 || address_16bit)
++		return false;
++
++	/*
++	 * Correcting CR2 by the repeated ADD immediate is safe only when that
++	 * register contributes exactly once as the memory operand's base.
++	 */
++	if ((modrm & 7) == 4) {
++		unsigned int index;
++
++		if (cmov_get_byte(&s, &sib) ||
++		    ((modrm >> 6) == 0 && (sib & 7) == 5) ||
++		    (sib & 7) != base_reg)
++			return false;
++		index = (sib >> 3) & 7;
++		if (index != 4 && index == base_reg)
++			return false;
++		return true;
++	}
++
++	if ((modrm >> 6) == 0 && (modrm & 7) == 5)
++		return false;
++	return (modrm & 7) == base_reg;
+ }
+ 
+-static bool quark_lock_at(const u8 __user *ip)
++static bool quark_lock_at(const u8 __user *ip, unsigned int base_reg)
+ {
+ 	u8 prefix;
+ 
+ 	return !copy_from_user_nofault(&prefix, ip, sizeof(prefix)) &&
+-	       prefix == 0xf0 && quark_lock_opcode(ip);
++	       prefix == 0xf0 && quark_lock_opcode(ip, base_reg);
+ }
+ 
+ static bool quark_decode_pic_add(const u8 __user *ip, unsigned int *reg,
+@@ -825,21 +850,46 @@ static bool quark_decode_pic_add(const u8 __user *ip, unsigned int *reg,
+ 	return true;
+ }
+ 
++static bool quark_pic_expected_reg(const u8 __user *add_ip, unsigned int reg,
++				   u32 immediate, u32 *expected)
++{
++	const u8 __user *thunk_ip;
++	u8 call[5], thunk[4];
++	u32 relative;
++
++	if ((unsigned long)add_ip < sizeof(call) ||
++	    copy_from_user_nofault(call, add_ip - sizeof(call), sizeof(call)) ||
++	    call[0] != 0xe8)
++		return false;
++
++	relative = call[1] | ((u32)call[2] << 8) | ((u32)call[3] << 16) |
++		   ((u32)call[4] << 24);
++	thunk_ip = add_ip + (s32)relative;
++	if (copy_from_user_nofault(thunk, thunk_ip, sizeof(thunk)) ||
++	    thunk[0] != 0x8b || thunk[1] != ((reg << 3) | 4) ||
++	    thunk[2] != 0x24 || thunk[3] != 0xc3)
++		return false;
++
++	/* The thunk loads the return address, which is the ADD's address. */
++	*expected = (u32)(unsigned long)add_ip + immediate;
++	return true;
++}
++
+ /*
+  * Quark erratum 71538 re-executes the instruction before a LOCKed operation
+  * when that operation raises a page fault.  PIC code commonly places
+  * "add imm32, %reg" immediately before its first atomic GOT access.  The
+  * saved EIP may identify either the LOCK prefix or the duplicated ADD.  Undo
+- * the duplicate ADD, skip LOCK, and let the unlocked operation take an
+- * ordinary COW/not-present fault on retry.  Omitting LOCK is Intel's
+- * documented uniprocessor workaround.
++ * the duplicate ADD, correct CR2, skip LOCK, and ask the normal page-fault
++ * path to complete the COW/not-present fault before returning to userspace.
++ * Omitting LOCK is Intel's documented uniprocessor workaround.
+  */
+ static int quark_lock_fault(struct pt_regs *regs, unsigned long error_code)
+ {
+ 	const u8 __user *add_ip, *ip, *lock_ip;
+-	u32 immediate;
++	u32 current_reg, expected_reg, immediate;
+ 	unsigned int reg;
+-	bool rewound_eip = false;
++	u8 prefix;
+ 
+ 	if (boot_cpu_data.x86_vfm != INTEL_QUARK_X1000 ||
+ 	    (error_code != QUARK_LOCK_NOT_PRESENT_ERROR &&
+@@ -847,7 +897,8 @@ static int quark_lock_fault(struct pt_regs *regs, unsigned long error_code)
+ 		return NOTIFY_DONE;
+ 
+ 	ip = (const u8 __user *)regs->ip;
+-	if (quark_lock_at(ip)) {
++	if (!copy_from_user_nofault(&prefix, ip, sizeof(prefix)) &&
++	    prefix == 0xf0) {
+ 		if (regs->ip < 6)
+ 			return NOTIFY_DONE;
+ 		lock_ip = ip;
+@@ -860,29 +911,39 @@ static int quark_lock_fault(struct pt_regs *regs, unsigned long error_code)
+ 		 */
+ 		add_ip = ip;
+ 		lock_ip = ip + 6;
+-		if (!quark_decode_pic_add(add_ip, &reg, &immediate) ||
+-		    !quark_lock_at(lock_ip))
+-			return NOTIFY_DONE;
+-		rewound_eip = true;
+ 	}
+ 
++	if (!quark_decode_pic_add(add_ip, &reg, &immediate) ||
++	    !quark_lock_at(lock_ip, reg) ||
++	    !quark_pic_expected_reg(add_ip, reg, immediate, &expected_reg))
++		return NOTIFY_DONE;
++
+ 	atomic64_inc(&lock_fault_count);
+-	if (!rewound_eip &&
+-	    !quark_decode_pic_add(add_ip, &reg, &immediate)) {
++	current_reg = cmov_get_reg(regs, reg);
++	if (current_reg == expected_reg) {
++		/* The fault was precise; only omit LOCK on the retry. */
++	} else if (current_reg == expected_reg + immediate) {
++		/* The PIC ADD was replayed, so both its base and CR2 are high. */
++		cmov_set_reg(regs, reg, current_reg - immediate, 4);
++		write_cr2(read_cr2() - immediate);
++	} else {
+ 		atomic64_inc(&lock_unrecoverable_count);
+-		pr_warn_ratelimited("pid %d: cannot safely recover Quark LOCK fault at %#lx\n",
+-				    task_pid_nr(current), (unsigned long)lock_ip);
++		pr_warn_ratelimited("pid %d: unexpected PIC base %#x for Quark LOCK fault at %#lx (expected %#x or %#x)\n",
++				    task_pid_nr(current), current_reg,
++				    (unsigned long)lock_ip, expected_reg,
++				    expected_reg + immediate);
+ 		return NOTIFY_DONE;
+ 	}
+-	cmov_set_reg(regs, reg, cmov_get_reg(regs, reg) - immediate, 4);
+ 
+-	/* Retry the read-modify-write instruction without its LOCK prefix. */
++	/* Resolve the original fault before retrying without the LOCK prefix. */
+ 	regs->ip = (unsigned long)lock_ip + 1;
+ 	atomic64_inc(&lock_recovered_count);
+ 	if (verbose)
+ 		pr_info_ratelimited("pid %d: recovered Quark LOCK fault at %#lx\n",
+ 				    task_pid_nr(current), (unsigned long)lock_ip);
+-	return NOTIFY_STOP;
++
++	/* Private handshake with do_user_addr_fault(): continue with fixed CR2. */
++	return NOTIFY_BAD;
+ }
+ 
+ static ssize_t quark_compat_stats_read(struct file *file,
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 06ce1af0c..c3b7666b4 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1224,10 +1224,24 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	 */
+ 	if (IS_ENABLED(CONFIG_X86_QUARK_COMPAT) &&
+ 	    unlikely(error_code == 0xffff0006UL ||
+-		     error_code == 0xffff0007UL) &&
+-	    notify_die(DIE_PAGE_FAULT, "Quark LOCK page fault", regs,
+-		       error_code, X86_TRAP_PF, SIGSEGV) == NOTIFY_STOP)
+-		return;
++		     error_code == 0xffff0007UL)) {
++		int quark_result;
++
++		quark_result = notify_die(DIE_PAGE_FAULT,
++					  "Quark LOCK page fault", regs,
++					  error_code, X86_TRAP_PF, SIGSEGV);
++		if (quark_result == NOTIFY_STOP)
++			return;
++		if (quark_result == NOTIFY_BAD) {
++			/*
++			 * The QuarkCompat notifier repaired the repeated
++			 * instruction and CR2.  Complete the original page
++			 * fault before retrying the unlocked operation.
++			 */
++			error_code &= 0xffffUL;
++			address = read_cr2();
++		}
++	}
+ 
+ 	tsk = current;
+ 	mm = tsk->mm;
