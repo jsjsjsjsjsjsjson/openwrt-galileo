@@ -240,3 +240,77 @@ index 798db8b..95febef 100644
  #include <stdint.h>
  
  #ifdef __cplusplus
+diff --git a/adb/usb_linux_client.c b/adb/usb_linux_client.c
+--- a/adb/usb_linux_client.c
++++ b/adb/usb_linux_client.c
+@@ -58,5 +58,10 @@ struct usb_handle
+     int bulk_out; /* "out" from the host's perspective => source for adbd */
+     int bulk_in;  /* "in" from the host's perspective => sink for adbd */
++
++    /* Preserve bytes beyond the current ADB header/payload read. */
++    unsigned char read_buffer[MAX_PACKET_SIZE_HS];
++    size_t read_pos;
++    size_t read_size;
+ };
+ 
+ static const struct {
+@@ -310,3 +315,5 @@ static void init_functionfs(struct usb_handle *h)
++    h->read_pos = 0;
++    h->read_size = 0;
+     return;
+ 
+ err:
+@@ -376,20 +383,34 @@ static int usb_ffs_write(usb_handle *h, const void *data, int len)
+-static int bulk_read(int bulk_out, char *buf, size_t length)
++static int bulk_read(usb_handle *h, char *buf, size_t length)
+ {
+     size_t count = 0;
+     int ret;
+ 
+-    do {
+-        ret = adb_read(bulk_out, buf + count, length - count);
+-        if (ret < 0) {
+-            if (errno != EINTR) {
+-                D("[ bulk_read failed fd=%d length=%zu count=%zu ]\n",
+-                                           bulk_out, length, count);
+-                return ret;
++    while (count < length) {
++        if (h->read_pos == h->read_size) {
++            /* A single HS packet (also aligned for FS). Never queue a
++             * short buffer or a multi-descriptor OUT request on pch_udc.
++             * Host ZLPs terminate transfers, not the ADB byte stream.
++             */
++            ret = adb_read(h->bulk_out, h->read_buffer,
++                           sizeof(h->read_buffer));
++            if (ret < 0) {
++                if (errno == EINTR)
++                    continue;
++                return -1;
+             }
+-        } else {
+-            count += ret;
++            if (ret == 0)
++                continue;
++            h->read_pos = 0;
++            h->read_size = ret;
+         }
+-    } while (count < length);
++        size_t available = h->read_size - h->read_pos;
++        size_t copy = length - count;
++        if (copy > available)
++            copy = available;
++        memcpy(buf + count, h->read_buffer + h->read_pos, copy);
++        h->read_pos += copy;
++        count += copy;
++    }
+ 
+     return count;
+ }
+@@ -406,6 +426,6 @@ static int usb_ffs_read(usb_handle *h, void *data, int len)
+ 
+     D("about to read (fd=%d, len=%d)\n", h->bulk_out, len);
+-    n = bulk_read(h->bulk_out, data, len);
++    n = bulk_read(h, data, len);
+     if (n != len) {
+         D("ERROR: fd = %d, n = %d, errno = %d (%s)\n",
+             h->bulk_out, n, errno, strerror(errno));

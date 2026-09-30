@@ -1,0 +1,82 @@
+--- a/drivers/usb/gadget/udc/pch_udc.c
++++ b/drivers/usb/gadget/udc/pch_udc.c
+@@ -15,6 +15,7 @@
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/gadget.h>
+ #include <linux/irq.h>
++#include <linux/msi.h>
+ 
+ #define PCH_VBUS_PERIOD		3000	/* VBUS polling period (msec) */
+ #define PCH_VBUS_INTERVAL	10	/* VBUS polling interval (msec) */
+@@ -2071,8 +2072,8 @@
+ 	req->req.actual = req->req.length;
+ 	req->td_data_last->status = PCH_UDC_BS_HST_BSY | PCH_UDC_DMA_LAST;
+ 	req->td_data->status = PCH_UDC_BS_HST_BSY | PCH_UDC_DMA_LAST;
+-	complete_req(ep, req, 0);
+ 	req->dma_going = 0;
++	complete_req(ep, req, 0);
+ 	if (!list_empty(&ep->queue)) {
+ 		pch_udc_wait_ep_stall(ep);
+ 		pch_udc_ep_clear_nak(ep);
+@@ -2685,13 +2686,11 @@
+ }
+ 
+ /**
+- * pch_udc_isr() - This function handles interrupts from the PCH USB Device
+- * @irq:	Interrupt request number
+- * @pdev:	Reference to the device structure
++ * pch_udc_handle_interrupt() - Handle one snapshot of UDC interrupt status
++ * @dev:	Reference to the device structure
+  */
+-static irqreturn_t pch_udc_isr(int irq, void *pdev)
++static irqreturn_t pch_udc_handle_interrupt(struct pch_udc_dev *dev)
+ {
+-	struct pch_udc_dev *dev = (struct pch_udc_dev *) pdev;
+ 	u32 dev_intr, ep_intr;
+ 	int i;
+ 
+@@ -2745,6 +2744,44 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Intel's Quark BSP masks the MSI vector and drains pending events before
++ * unmasking it. Use the PCI MSI API rather than private msi_desc fields.
++ */
++static irqreturn_t pch_udc_isr(int irq, void *pdev)
++{
++	struct pch_udc_dev *dev = pdev;
++	irqreturn_t handled = IRQ_NONE;
++	unsigned int pass;
++#ifdef CONFIG_PCI_MSI
++	struct irq_data *data = NULL;
++#endif
++
++	if (dev->pdev->vendor != PCI_VENDOR_ID_INTEL ||
++	    dev->pdev->device != PCI_DEVICE_ID_INTEL_QUARK_X1000_UDC)
++		return pch_udc_handle_interrupt(dev);
++
++#ifdef CONFIG_PCI_MSI
++	if (dev->pdev->msi_enabled) {
++		data = irq_get_irq_data(irq);
++		if (data && irq_data_get_msi_desc(data))
++			pci_msi_mask_irq(data);
++		else
++			data = NULL;
++	}
++#endif
++	/* Bound hard-IRQ work even if a device continually raises events. */
++	for (pass = 0; pass < 32; pass++) {
++		if (pch_udc_handle_interrupt(dev) == IRQ_NONE)
++			break;
++		handled = IRQ_HANDLED;
++	}
++#ifdef CONFIG_PCI_MSI
++	if (data)
++		pci_msi_unmask_irq(data);
++#endif
++	return handled;
++}
++
+ /**
+  * pch_udc_setup_ep0() - This function enables control endpoint for traffic
+  * @dev:	Reference to the device structure
