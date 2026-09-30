@@ -1,3 +1,10 @@
+# OpenWrt for Intel Galileo Gen 2
+
+This repository adds Intel Galileo Gen 2 support to OpenWrt, including
+QuarkCompat for the Quark X1000, onboard hardware support and USB ADB.
+See the [Galileo target README](target/linux/x86/galileo/README.md) for
+build instructions, boot images and board-specific usage.
+
 ![OpenWrt logo](include/logo.png)
 
 OpenWrt Project is a Linux operating system targeting embedded devices. Instead
